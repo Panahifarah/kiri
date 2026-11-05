@@ -1227,7 +1227,22 @@ fn mount_container_filesystems(privileged: bool, shm_size: u64) -> io::Result<()
         (c"/proc/self/fd/2", c"dev/stderr"),
         (c"pts/ptmx", c"dev/ptmx"),
     ] {
-        // SAFETY: valid NUL-terminated strings; devtmpfs may have some.
+        if privileged {
+            // devtmpfs is one filesystem for the whole kernel: this dev is the
+            // VM's /dev, and on a Linux host, where there is no VM, the host's
+            // own. Replacing its ptmx with a link to pts/ptmx (mode 000 in the
+            // host's devpts) stopped every new terminal on the host. Nothing
+            // there is changed, only what is missing is added: the real ptmx
+            // (5:2) opens the devpts mounted beside it at dev/pts below, so
+            // the container still gets its own ptys (Linux 4.7 and later).
+            if link == c"dev/ptmx" || fs::symlink_metadata(Path::new(std::ffi::OsStr::from_bytes(link.to_bytes()))).is_ok() {
+                continue;
+            }
+            // SAFETY: valid NUL-terminated strings.
+            unsafe { libc::symlink(target.as_ptr(), link.as_ptr()) };
+            continue;
+        }
+        // SAFETY: valid NUL-terminated strings.
         unsafe {
             libc::unlink(link.as_ptr());
             libc::symlink(target.as_ptr(), link.as_ptr())
