@@ -18,6 +18,12 @@ FAILED=()
 # own Finder folder (~/Kiri Dev) and no *.kiri.localhost routers: there is
 # one pair of ports 80 and 443 on a Mac, and the installed Kiri has them.
 FEATURE=${DOCKER_CONTEXT#kiri}; FEATURE=${FEATURE#-}
+# The engine under test's socket. Every `kiri` command (machines, k8s) and
+# every direct API call goes there, never to another Kiri on this Mac: once,
+# the Kubernetes checks ran on the installed Kiri and deleted its cluster.
+SOCK=$(docker context inspect "$DOCKER_CONTEXT" --format '{{.Endpoints.docker.Host}}' 2>/dev/null); SOCK=${SOCK#unix://}
+[ -S "$SOCK" ] || { echo "e2e: no engine socket for context $DOCKER_CONTEXT ($SOCK)"; exit 1; }
+export KIRI_SOCKET=$SOCK
 if [ -z "$FEATURE" ]; then KF="$HOME/Kiri"; else KF="$HOME/Kiri $(printf %s "${FEATURE:0:1}" | tr a-z A-Z)${FEATURE:1}"; fi
 KFQ=$(printf %q "$KF")
 
@@ -185,6 +191,15 @@ t internet-dns "Address" $D run --rm alpine nslookup example.com
 t dns-default-bridge-gateway "nameserver 172.17.0.1" $D run --rm alpine cat /etc/resolv.conf
 code dns-default-bridge-no-loopback 1 $D run --rm alpine grep -q 127.0.0.11 /etc/resolv.conf
 t internet-https "200" $D run --rm curlimages/curl:latest -s -o /dev/null -w '%{http_code}' https://www.google.com
+# Each container gets the last one's address and MAC: its first download
+# broke mid-TLS or stalled while the old one's veth lingered, and one that
+# keeps running lost its gateway whenever the bridge's MAC moved.
+APKIDX=https://dl-cdn.alpinelinux.org/alpine/v3.22/main/aarch64/APKINDEX.tar.gz
+t first-download-x8 "8" bash -c "n=0; for i in \$(seq 8); do $D run --rm curlimages/curl:latest -s -m 20 -o /dev/null -w '%{exitcode}' $APKIDX | grep -qx 0 && n=\$((n+1)); done; echo \$n"
+$D run -d --name dl curlimages/curl:latest sh -c "while true; do curl -s -m 10 -o /dev/null -w '%{exitcode} ' $APKIDX; done" >/dev/null
+for _ in $(seq 6); do $D run --rm alpine true; sleep 1; done
+code download-while-others-start 1 bash -c "$D logs dl 2>&1 | grep -qE '(^| )[1-9][0-9]* '"
+$D rm -f dl >/dev/null
 t none-net "lo" $D run --rm --network none alpine ip link
 code none-no-internet 1 $D run --rm --network none alpine wget -qO- -T 2 http://example.com
 t host-net "192.168.64." $D run --rm --network host alpine ip -4 addr show eth0
@@ -219,6 +234,7 @@ code network-rm-builtin 1 $D network rm bridge
 # (as with Docker), while the network itself still works.
 $D network create --internal intnet >/dev/null
 $D run -d --name intweb --network intnet nginx:alpine >/dev/null
+nginx_up intweb
 t internal-same-net "Welcome to nginx" $D run --rm --network intnet alpine wget -qO- -T 5 http://intweb
 t internal-no-route "unreachable" $D run --rm --network intnet alpine sh -c 'ping -c 1 -W 2 1.1.1.1 2>&1; true'
 t internal-no-default "none" $D run --rm --network intnet alpine sh -c 'ip route | grep -q default && echo default || echo none'
@@ -405,6 +421,9 @@ t vol-copyup-owner "same:redis:redis 755" bash -c "i=\$($D run --rm redis:7-alpi
 t vol-copyup-tree "same" bash -c "i=\$($D run --rm alpine sh -c 'cd /etc/apk && { find . -exec stat -c \"%n %A %u %g\" {} +; find . -type f -exec md5sum {} +; } | sort | md5sum'); v=\$($D run --rm -v tapk:/etc/apk alpine sh -c 'cd /etc/apk && { find . -exec stat -c \"%n %A %u %g\" {} +; find . -type f -exec md5sum {} +; } | sort | md5sum'); [ \"\$i\" = \"\$v\" ] && echo same"
 t vol-copyup-not-over "1 mine" bash -c "$D run --rm -v tkeep:/usr/share/nginx/html nginx:alpine sh -c 'rm /usr/share/nginx/html/*; echo mine > /usr/share/nginx/html/mine' && $D run --rm -v tkeep:/usr/share/nginx/html nginx:alpine sh -c 'echo \$(ls /usr/share/nginx/html | wc -l) \$(cat /usr/share/nginx/html/mine)'"
 t redis-volume "PONG OK running" bash -c "$D run -d --name rv -v tredis:/data redis:7-alpine >/dev/null; for i in \$(seq 50); do $D exec rv redis-cli ping 2>/dev/null | grep -q PONG && break; sleep 0.2; done; p=\$($D exec rv redis-cli ping); s=\$($D exec rv redis-cli save); sleep 1; echo \$p \$s \$($D inspect -f '{{.State.Status}}' rv)"
+# A volume over part of a bind (`./:/app` and `/app/node_modules`) is filled
+# from the image, as Docker does, never from the host's folder under it.
+t vol-copyup-under-bind "index.html" bash -c "h=\$(mktemp -d); mkdir \$h/html; echo mac > \$h/html/from-host.txt; $D run --rm -v \$h:/usr/share/nginx -v /usr/share/nginx/html nginx:alpine sh -c 'cd /usr/share/nginx/html; [ -e from-host.txt ] && echo from the host || ls'; rm -rf \$h"
 $D rm -f rv >/dev/null 2>&1; $D volume rm towner tapk tkeep tredis >/dev/null 2>&1
 t vol-in-use "in use" bash -c "$D run -d --name vu -v tvol:/v alpine sleep 30 >/dev/null; $D volume rm tvol"
 $D rm -f vu >/dev/null
@@ -663,6 +682,13 @@ t native-again "aarch64" bash -c "$D pull -q --platform linux/arm64 alpine >/dev
 $D rmi amd64/alpine:3.22 >/dev/null 2>&1
 
 section "security: seccomp, capabilities, read-only"
+# Docker's two defaults in a container's own network: any port and ping
+# without root. --sysctl wins; host networking keeps the VM's own.
+t unpriv-port-start "0" $D run --rm alpine cat /proc/sys/net/ipv4/ip_unprivileged_port_start
+t unpriv-ping-range "0	2147483647" $D run --rm alpine cat /proc/sys/net/ipv4/ping_group_range
+t unpriv-listen-80 "listening" $D run --rm -u 1000 alpine sh -c 'nc -lk -p 80 >/dev/null 2>&1 & sleep 0.5; netstat -ltn | grep -q ":80 " && echo listening'
+t unpriv-sysctl-wins "1024" $D run --rm --sysctl net.ipv4.ip_unprivileged_port_start=1024 alpine cat /proc/sys/net/ipv4/ip_unprivileged_port_start
+t unpriv-port-host-net "1024" $D run --rm --network host alpine cat /proc/sys/net/ipv4/ip_unprivileged_port_start
 t seccomp-on "Seccomp:	2" $D run --rm alpine grep Seccomp: /proc/self/status
 t seccomp-userns "not permitted" $D run --rm alpine unshare -U true
 t seccomp-keyctl "not permitted" bash -c "$D run --rm alpine sh -c 'apk add -q keyutils >/dev/null 2>&1; keyctl show 2>&1'"
@@ -678,7 +704,10 @@ t stdin-slow-reader "30000000" bash -c "head -c 30000000 /dev/zero | $D run --rm
 t seccomp-fork "node ok" $D run --rm node:22-alpine node -e 'require("child_process").execSync("true"); console.log("node ok")'
 t cap-default "00000000a80425fb" $D run --rm alpine grep CapEff /proc/self/status
 t cap-drop-all "0000000000000000" $D run --rm --cap-drop ALL alpine grep CapEff /proc/self/status
-t cap-drop-net-raw "permission denied" $D run --rm --cap-drop NET_RAW alpine ping -c1 -W1 127.0.0.1
+# ping needs no NET_RAW: it uses ping sockets, which ping_group_range opens
+# to every group, as on Docker. Without them, dropping NET_RAW stops it.
+t cap-drop-net-raw-ping "round-trip" $D run --rm --cap-drop NET_RAW alpine ping -c1 -W1 127.0.0.1
+t cap-drop-net-raw "permission denied" $D run --rm --cap-drop NET_RAW --sysctl net.ipv4.ping_group_range="1 0" alpine ping -c1 -W1 127.0.0.1
 t cap-add-net-admin "ok" bash -c "$D run --rm --cap-add NET_ADMIN alpine sh -c 'ip link set lo mtu 1400 && echo ok'"
 t cap-add-sys-admin "mounted" $D run --rm --cap-add SYS_ADMIN alpine sh -c 'mount -t tmpfs t /mnt && echo mounted'
 t cap-inspect "NET_ADMIN]" bash -c "$D create --name capi --cap-add NET_ADMIN alpine >/dev/null; $D inspect -f '{{.HostConfig.CapAdd}}' capi; $D rm capi >/dev/null"
@@ -731,14 +760,16 @@ fi
 if [ "${K8S:-0}" = 1 ]; then
   section "Kubernetes (K8S=1)"
   KH=$(mktemp -d); mkdir -p "$KH/.kube"
-  KK="env HOME=$KH KIRI_SOCKET=$HOME/.kiri/run/docker.sock $KQ k8s"
+  KK="env HOME=$KH KIRI_SOCKET=$SOCK $KQ k8s"
   t k8s-start "is ready" bash -c "$KK start"
-  t k8s-node "Ready" env HOME="$KH" kubectl --context kiri get nodes
-  t k8s-deploy "successfully rolled out" bash -c "env HOME=$KH kubectl --context kiri create deployment web --image=nginx:alpine >/dev/null && env HOME=$KH kubectl --context kiri rollout status deploy/web --timeout=120s"
+  # The context `kiri k8s start` wrote: named after the Kiri build, not always `kiri`.
+  KCTX=$(env HOME="$KH" kubectl config get-contexts -o name 2>/dev/null | head -1); KCTX=${KCTX:-kiri}
+  t k8s-node "Ready" env HOME="$KH" kubectl --context $KCTX get nodes
+  t k8s-deploy "successfully rolled out" bash -c "env HOME=$KH kubectl --context $KCTX create deployment web --image=nginx:alpine >/dev/null && env HOME=$KH kubectl --context $KCTX rollout status deploy/web --timeout=120s"
   # CoreDNS may still be starting: ask a few times, as a client would.
-  t k8s-service-dns "Welcome to nginx" bash -c "env HOME=$KH kubectl --context kiri expose deploy web --port 80 >/dev/null; for i in 1 2 3 4 5 6; do out=\$(env HOME=$KH kubectl --context kiri run t\$i --rm -i --restart=Never --image=alpine -- wget -qO- -T 5 http://web.default.svc.cluster.local 2>/dev/null); echo \"\$out\" | grep -q Welcome && break; sleep 3; done; echo \"\$out\""
-  t k8s-loadbalancer "Welcome to nginx" bash -c "env HOME=$KH kubectl --context kiri expose deploy web --name web-lb --type=LoadBalancer --port 18091 --target-port 80 >/dev/null; for i in \$(seq 60); do curl -s -m 2 http://localhost:18091 | grep -q Welcome && break; sleep 2; done; curl -s -m 2 http://localhost:18091"
-  t k8s-loadbalancer-gone "gone" bash -c "env HOME=$KH kubectl --context kiri delete svc web-lb >/dev/null; sleep 7; curl -s -m 2 http://localhost:18091 || echo gone"
+  t k8s-service-dns "Welcome to nginx" bash -c "env HOME=$KH kubectl --context $KCTX expose deploy web --port 80 >/dev/null; for i in 1 2 3 4 5 6; do out=\$(env HOME=$KH kubectl --context $KCTX run t\$i --rm -i --restart=Never --image=alpine -- wget -qO- -T 5 http://web.default.svc.cluster.local 2>/dev/null); echo \"\$out\" | grep -q Welcome && break; sleep 3; done; echo \"\$out\""
+  t k8s-loadbalancer "Welcome to nginx" bash -c "env HOME=$KH kubectl --context $KCTX expose deploy web --name web-lb --type=LoadBalancer --port 18091 --target-port 80 >/dev/null; for i in \$(seq 60); do curl -s -m 2 http://localhost:18091 | grep -q Welcome && break; sleep 2; done; curl -s -m 2 http://localhost:18091"
+  t k8s-loadbalancer-gone "gone" bash -c "env HOME=$KH kubectl --context $KCTX delete svc web-lb >/dev/null; sleep 7; curl -s -m 2 http://localhost:18091 || echo gone"
   t k8s-stop "exited" bash -c "$KK stop >/dev/null && $KK status"
   t k8s-resume "is ready" bash -c "$KK start"
   t k8s-delete "deleted" bash -c "$KK delete"
@@ -759,7 +790,7 @@ if [ "${SOAK:-0}" -gt 0 ]; then
   fds() { lsof -p "$DPID" 2>/dev/null | wc -l | tr -d ' '; }
   guest() { $D run --rm --network host alpine sh -c 'echo "$(ls /var/lib/kiri/containers 2>/dev/null | wc -l) $(ls -d /sys/fs/cgroup/kiri/*/ 2>/dev/null | wc -l) $(ip -o link | grep -c " kv") $(ls /run/kiri 2>/dev/null | wc -l) $(awk "/MemTotal/{t=\$2} /MemAvailable/{a=\$2} END{print t-a}" /proc/meminfo)"' 2>/dev/null; }
   # The balloon's pages count as used inside the guest; take them out.
-  ballooned() { curl -s --unix-socket "$HOME/.kiri/run/docker.sock" http://d/info | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d["KiriMemoryCeiling"] - d["KiriMemoryTarget"]) // 1024)'; }
+  ballooned() { curl -s --unix-socket "$SOCK" http://d/info | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d["KiriMemoryCeiling"] - d["KiriMemoryTarget"]) // 1024)'; }
   # Warm up, then take the baseline.
   for i in $(seq 20); do $D run --rm alpine true >/dev/null 2>&1; done
   read -r c0 g0 v0 r0 m0 <<<"$(guest)"; m0=$((m0 - $(ballooned)))
